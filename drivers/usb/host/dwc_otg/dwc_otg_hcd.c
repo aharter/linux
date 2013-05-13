@@ -40,10 +40,13 @@
  * header file.
  */
 
+#include <linux/usb.h>
+#include <linux/usb/hcd.h>
+
 #include "dwc_otg_hcd.h"
 #include "dwc_otg_regs.h"
 
-extern bool microframe_schedule;
+extern bool microframe_schedule, nak_holdoff_enable;
 
 //#define DEBUG_HOST_CHANNELS
 #ifdef DEBUG_HOST_CHANNELS
@@ -694,6 +697,31 @@ static void reset_tasklet_func(void *data)
 	dwc_otg_hcd->flags.b.port_reset_change = 1;
 }
 
+static void completion_tasklet_func(void *ptr)
+{
+	dwc_otg_hcd_t *hcd = (dwc_otg_hcd_t *) ptr;
+	struct urb *urb;
+	urb_tq_entry_t *item;
+	dwc_irqflags_t flags;
+
+	DWC_SPINLOCK_IRQSAVE(hcd->lock, &flags);
+	while (!DWC_TAILQ_EMPTY(&hcd->completed_urb_list)) {
+		item = DWC_TAILQ_FIRST(&hcd->completed_urb_list);
+		urb = item->urb;
+		DWC_TAILQ_REMOVE(&hcd->completed_urb_list, item,
+				urb_tq_entries);
+		DWC_SPINUNLOCK_IRQRESTORE(hcd->lock, flags);
+		DWC_FREE(item);
+
+		usb_hcd_unlink_urb_from_ep(hcd->priv, urb);
+		usb_hcd_giveback_urb(hcd->priv, urb, urb->status);
+
+		DWC_SPINLOCK_IRQSAVE(hcd->lock, &flags);
+	}
+	DWC_SPINUNLOCK_IRQRESTORE(hcd->lock, flags);
+	return;
+}
+
 static void qh_list_free(dwc_otg_hcd_t * hcd, dwc_list_link_t * qh_list)
 {
 	dwc_list_link_t *item;
@@ -833,6 +861,7 @@ static void dwc_otg_hcd_free(dwc_otg_hcd_t * dwc_otg_hcd)
 
 	DWC_TIMER_FREE(dwc_otg_hcd->conn_timer);
 	DWC_TASK_FREE(dwc_otg_hcd->reset_tasklet);
+	DWC_TASK_FREE(dwc_otg_hcd->completion_tasklet);
 
 #ifdef DWC_DEV_SRPCAP
 	if (dwc_otg_hcd->core_if->power_down == 2 &&
@@ -877,7 +906,7 @@ int dwc_otg_hcd_init(dwc_otg_hcd_t * hcd, dwc_otg_core_if_t * core_if)
 	DWC_LIST_INIT(&hcd->periodic_sched_ready);
 	DWC_LIST_INIT(&hcd->periodic_sched_assigned);
 	DWC_LIST_INIT(&hcd->periodic_sched_queued);
-
+	DWC_TAILQ_INIT(&hcd->completed_urb_list);
 	/*
 	 * Create a host channel descriptor for each host channel implemented
 	 * in the controller. Initialize the channel descriptor array.
@@ -915,6 +944,9 @@ int dwc_otg_hcd_init(dwc_otg_hcd_t * hcd, dwc_otg_core_if_t * core_if)
 
 	/* Initialize reset tasklet. */
 	hcd->reset_tasklet = DWC_TASK_ALLOC("reset_tasklet", reset_tasklet_func, hcd);
+
+	hcd->completion_tasklet = DWC_TASK_ALLOC("completion_tasklet",
+						completion_tasklet_func, hcd);
 #ifdef DWC_DEV_SRPCAP
 	if (hcd->core_if->power_down == 2) {
 		/* Initialize Power on timer for Host power up in case hibernation */
@@ -1317,18 +1349,26 @@ dwc_otg_transaction_type_e dwc_otg_hcd_select_transactions(dwc_otg_hcd_t * hcd)
 
 		/*
 		 * Check to see if this is a NAK'd retransmit, in which case ignore for retransmission
-		 * we hold off on bulk retransmissions to reduce NAK interrupt overhead for
+		 * we hold off on bulk retransmissions to reduce NAK interrupt overhead for full-speed
 		 * cheeky devices that just hold off using NAKs
 		 */
-		if (dwc_full_frame_num(qh->nak_frame) == dwc_full_frame_num(dwc_otg_hcd_get_frame_number(hcd))) {
-			// Make fiq interrupt run on next frame (i.e. 8 uframes)
-			g_next_sched_frame = ((qh->nak_frame + 8) & ~7) & DWC_HFNUM_MAX_FRNUM;
-			qh_ptr = DWC_LIST_NEXT(qh_ptr);
-			continue;
+		if (nak_holdoff_enable && qh->do_split) {
+			if (qh->nak_frame != 0xffff &&
+				dwc_full_frame_num(qh->nak_frame) ==
+				dwc_full_frame_num(dwc_otg_hcd_get_frame_number(hcd))) {
+				/*
+				 * Revisit: Need to avoid trampling on periodic scheduling.
+				 * Currently we are safe because g_np_count != g_np_sent whenever we hit this,
+				 * but if this behaviour is changed then periodic endpoints will get a slower
+				 * polling rate.
+				 */
+				g_next_sched_frame = ((qh->nak_frame + 8) & ~7) & DWC_HFNUM_MAX_FRNUM;
+				qh_ptr = DWC_LIST_NEXT(qh_ptr);
+				continue;
+			} else {
+				qh->nak_frame = 0xffff;
+			}
 		}
-		else
-			qh->nak_frame = 0xffff;
-
 		if (microframe_schedule) {
 				DWC_SPINLOCK_IRQSAVE(channel_lock, &flags);
 				if (hcd->available_host_channels < 1) {
